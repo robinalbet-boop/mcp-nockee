@@ -234,6 +234,214 @@ server.tool(
   }
 );
 
+/* ============================================================================
+   NOCKEE MCP — OUTILS SUPPLÉMENTAIRES
+   ----------------------------------------------------------------------------
+   Où coller : dans server.js, JUSTE APRÈS le dernier server.tool(...) existant
+   (celui de 'nockee_clear_signatories') et AVANT la ligne :
+
+        const app = express();
+
+   Rien d'autre à modifier : ça réutilise le helper nockee(), la fonction
+   deleteAllPictures() et l'objet `server` déjà présents dans ton fichier.
+   ============================================================================ */
+
+
+/* --- Helper générique : paginer entièrement un endpoint "list" ------------- */
+async function nkListAll(path) {
+  const items = [];
+  let cursor = null;
+  do {
+    const sep = path.includes('?') ? '&' : '?';
+    const url = path + sep + 'limit=100' + (cursor ? `&cursor=${cursor}` : '');
+    const r = await nockee('GET', url);
+    if (Array.isArray(r.data)) items.push(...r.data);
+    cursor = r && r.next_cursor;
+  } while (cursor);
+  return items;
+}
+
+
+/* =========================== PHOTOS ======================================== */
+
+server.tool(
+  'nockee_list_pictures',
+  'List all pictures of a report (optionally filtered by type). Returns picture ids/urls. Types: element, key, global, global_key, meter, room.',
+  {
+    report_id: z.string().describe('UUID of the report'),
+    type: z.enum(['element', 'key', 'global', 'global_key', 'meter', 'room']).optional()
+      .describe('Optional picture type filter'),
+  },
+  async ({ report_id, type }) => {
+    let path = `/inspection_report_pictures?inspection_report=${report_id}`;
+    if (type) path += `&type=${type}`;
+    const items = await nkListAll(path);
+    const pictures = items.map(p => ({ id: p.id, type: p.type, url: p.url || p.file || null }));
+    return { content: [{ type: 'text', text: JSON.stringify({ count: pictures.length, pictures }, null, 2) }] };
+  }
+);
+
+server.tool(
+  'nockee_delete_picture',
+  'Delete a single picture by its id.',
+  { picture_id: z.string().describe('UUID of the picture') },
+  async ({ picture_id }) => {
+    await nockee('DELETE', `/inspection_report_pictures/${picture_id}`);
+    return { content: [{ type: 'text', text: 'Deleted picture: ' + picture_id }] };
+  }
+);
+
+server.tool(
+  'nockee_clear_pictures',
+  'Delete ALL pictures of a report (every type). Use to purge photos from an old or cloned report.',
+  { report_id: z.string().describe('UUID of the report') },
+  async ({ report_id }) => {
+    const total = await deleteAllPictures(report_id);   // fonction déjà présente dans server.js
+    return { content: [{ type: 'text', text: `${total} picture(s) deleted from report ${report_id}` }] };
+  }
+);
+
+
+/* =========================== PIÈCES (ROOMS) =============================== */
+
+server.tool(
+  'nockee_list_rooms',
+  'List all rooms of a report.',
+  { report_id: z.string().describe('UUID of the report') },
+  async ({ report_id }) => {
+    const items = await nkListAll(`/inspection_report_rooms?inspection_report=${report_id}`);
+    return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+server.tool(
+  'nockee_add_room',
+  'Create a room in a report. Pass the room fields in `data` (e.g. {"name":"Séjour"}).',
+  {
+    report_id: z.string().describe('UUID of the report'),
+    data: z.record(z.any()).describe('Room fields, e.g. { name, order, ... }'),
+  },
+  async ({ report_id, data }) => {
+    const r = await nockee('POST', '/inspection_report_rooms', { inspection_report: report_id, ...data });
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !r.id };
+  }
+);
+
+server.tool(
+  'nockee_update_room',
+  'Update a room. Pass changed fields in `data`.',
+  { room_id: z.string(), data: z.record(z.any()) },
+  async ({ room_id, data }) => {
+    const r = await nockee('PATCH', `/inspection_report_rooms/${room_id}`, data);
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !r.id };
+  }
+);
+
+server.tool(
+  'nockee_delete_room',
+  'Delete a room by id.',
+  { room_id: z.string() },
+  async ({ room_id }) => {
+    await nockee('DELETE', `/inspection_report_rooms/${room_id}`);
+    return { content: [{ type: 'text', text: 'Deleted room: ' + room_id }] };
+  }
+);
+
+
+/* =========================== ÉLÉMENTS ===================================== */
+
+server.tool(
+  'nockee_list_elements',
+  'List elements of a report (optionally of a specific room).',
+  {
+    report_id: z.string(),
+    room_id: z.string().optional().describe('Optional: filter by room'),
+  },
+  async ({ report_id, room_id }) => {
+    let path = `/inspection_report_elements?inspection_report=${report_id}`;
+    if (room_id) path += `&room=${room_id}`;
+    const items = await nkListAll(path);
+    return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+server.tool(
+  'nockee_add_element',
+  'Add an element to a room. Pass fields in `data` (e.g. {"room": "<room_id>", "name":"Mur", ...}).',
+  { report_id: z.string(), data: z.record(z.any()) },
+  async ({ report_id, data }) => {
+    const r = await nockee('POST', '/inspection_report_elements', { inspection_report: report_id, ...data });
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !r.id };
+  }
+);
+
+server.tool(
+  'nockee_update_element',
+  'Update an element (state, comment, etc.). Pass changed fields in `data`.',
+  { element_id: z.string(), data: z.record(z.any()) },
+  async ({ element_id, data }) => {
+    const r = await nockee('PATCH', `/inspection_report_elements/${element_id}`, data);
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !r.id };
+  }
+);
+
+server.tool(
+  'nockee_delete_element',
+  'Delete an element by id.',
+  { element_id: z.string() },
+  async ({ element_id }) => {
+    await nockee('DELETE', `/inspection_report_elements/${element_id}`);
+    return { content: [{ type: 'text', text: 'Deleted element: ' + element_id }] };
+  }
+);
+
+
+/* =========================== CLÉS & COMPTEURS ============================= */
+
+server.tool(
+  'nockee_list_keys',
+  'List keys of a report.',
+  { report_id: z.string() },
+  async ({ report_id }) => {
+    const items = await nkListAll(`/inspection_report_keys?inspection_report=${report_id}`);
+    return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+server.tool(
+  'nockee_list_meters',
+  'List meters of a report.',
+  { report_id: z.string() },
+  async ({ report_id }) => {
+    const items = await nkListAll(`/inspection_report_meters?inspection_report=${report_id}`);
+    return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+
+/* =========================== PASSE-PARTOUT ================================
+   Accès brut à N'IMPORTE QUEL endpoint de l'API Nockee v2.
+   Permet de couvrir tout ce qui n'a pas d'outil dédié :
+   compare, invalidate_signatures, restore, external_users, estates,
+   persons, workspaces, webhooks, création de clés/compteurs, etc.
+   path = chemin après /v2  (ex: "/inspection_reports/<id>/restore")
+   ========================================================================= */
+server.tool(
+  'nockee_request',
+  'Advanced: raw call to any Nockee API v2 endpoint. method = GET/POST/PATCH/DELETE, path = everything after /v2 (must start with "/"), body = optional JSON object. Use for endpoints without a dedicated tool.',
+  {
+    method: z.enum(['GET', 'POST', 'PATCH', 'DELETE']),
+    path: z.string().describe('Path after /v2, e.g. "/inspection_reports/<id>/restore" or "/estates?limit=20"'),
+    body: z.record(z.any()).optional().describe('Optional JSON body for POST/PATCH'),
+  },
+  async ({ method, path, body }) => {
+    if (!path.startsWith('/')) path = '/' + path;
+    const r = await nockee(method, path, body);
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+  }
+);
+
+
 const app = express();
 app.use(express.json());
 
