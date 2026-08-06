@@ -4,7 +4,7 @@ import { z } from 'zod';
 import express from 'express';
 import https from 'https';
 
-const NOCKEE_KEY = process.env.NOCKEE_API_KEY || 'Uw5SReDnLWK99u3qcbtFEJzLPinvua7IMkF1DuTbBH8iEkNTVC';
+const NOCKEE_KEY = process.env.NOCKEE_API_KEY;
 const MCP_SECRET = process.env.MCP_SECRET;
 const PORT = process.env.PORT || 3000;
 
@@ -26,19 +26,71 @@ function nockee(method, path, body) {
   });
 }
 
-async function deleteAllPictures(reportId) {
-  let total = 0;
-  for (const type of ['element', 'key', 'global', 'global_key', 'meter', 'room']) {
-    let cursor = null;
-    while (true) {
-      let url = `/inspection_report_pictures?inspection_report=${reportId}&type=${type}&limit=100`;
-      if (cursor) url += `&cursor=${cursor}`;
-      const r = await nockee('GET', url);
-      if (!r.data?.length) break;
-      for (const pic of r.data) { await nockee('DELETE', `/inspection_report_pictures/${pic.id}`); total++; }
-      cursor = r.next_cursor;
-      if (!cursor) break;
+/* --------------------------------------------------------------------------
+   Pagination générique d'un endpoint "list" (renvoie { data, next_cursor }).
+   -------------------------------------------------------------------------- */
+async function nkListAll(path) {
+  const items = [];
+  let cursor = null;
+  do {
+    const sep = path.includes('?') ? '&' : '?';
+    const url = path + sep + 'limit=100' + (cursor ? `&cursor=${cursor}` : '');
+    const r = await nockee('GET', url);
+    if (Array.isArray(r.data)) items.push(...r.data);
+    cursor = r && r.next_cursor;
+  } while (cursor);
+  return items;
+}
+
+/* --------------------------------------------------------------------------
+   CORRECTIF PHOTOS
+   L'API /inspection_report_pictures n'accepte PAS le filtre inspection_report
+   pour les types room / element / meter / key : il faut filtrer par le parent
+   correspondant (room=, element=, meter=, key=) + type=. Seuls global et
+   global_key se filtrent par inspection_report.
+   On collecte donc toutes les photos en parcourant chaque parent.
+   -------------------------------------------------------------------------- */
+async function collectAllPictures(reportId, typeFilter) {
+  const wanted = typeFilter
+    ? [typeFilter]
+    : ['global', 'global_key', 'room', 'element', 'meter', 'key'];
+  const pics = [];
+
+  // Photos rattachées directement au rapport (globales)
+  for (const type of ['global', 'global_key']) {
+    if (!wanted.includes(type)) continue;
+    pics.push(...await nkListAll(
+      `/inspection_report_pictures?inspection_report=${reportId}&type=${type}`
+    ));
+  }
+
+  // Photos rattachées à un parent : on liste chaque parent puis ses photos
+  const parents = [
+    { type: 'room',    resource: 'rooms',    key: 'room' },
+    { type: 'element', resource: 'elements', key: 'element' },
+    { type: 'meter',   resource: 'meters',   key: 'meter' },
+    { type: 'key',     resource: 'keys',     key: 'key' },
+  ];
+  for (const p of parents) {
+    if (!wanted.includes(p.type)) continue;
+    const objs = await nkListAll(
+      `/inspection_report_${p.resource}?inspection_report=${reportId}`
+    );
+    for (const o of objs) {
+      pics.push(...await nkListAll(
+        `/inspection_report_pictures?${p.key}=${o.id}&type=${p.type}`
+      ));
     }
+  }
+  return pics;
+}
+
+async function deleteAllPictures(reportId) {
+  const pics = await collectAllPictures(reportId);
+  let total = 0;
+  for (const pic of pics) {
+    await nockee('DELETE', `/inspection_report_pictures/${pic.id}`);
+    total++;
   }
   return total;
 }
@@ -53,7 +105,7 @@ async function deleteAllSignatories(reportId) {
   return count;
 }
 
-const server = new McpServer({ name: 'nockee', version: '1.0.0' });
+const server = new McpServer({ name: 'nockee', version: '1.1.0' });
 
 server.tool(
   'nockee_list_reports',
@@ -95,12 +147,12 @@ server.tool(
 
 server.tool(
   'nockee_create_report',
-  'Create an EDL report in Nockee. If from_report_id is provided, clones that report (include_photos always false). Otherwise creates from scratch with the provided address.',
+  'Create an EDL report in Nockee. If from_report_id is provided, clones that report then purges ALL photos (room/element/meter/key/global). Otherwise creates from scratch with the provided address.',
   {
     type: z.enum(['residential_lease_check_in', 'residential_lease_check_out'])
       .describe('check_in = EDLE (entry), check_out = EDLS (exit)'),
     scheduled_date: z.string().describe('Appointment date YYYY-MM-DD'),
-    from_report_id: z.string().optional().describe('UUID of source report for cloning (include_photos always false)'),
+    from_report_id: z.string().optional().describe('UUID of source report for cloning (photos always purged after clone)'),
     address_line1: z.string().optional().describe('Address line 1 (required if from scratch)'),
     address_postal_code: z.string().optional(),
     address_city: z.string().optional(),
@@ -123,7 +175,15 @@ server.tool(
     const r = await nockee('POST', '/inspection_reports', body);
     if (!r.id) return { content: [{ type: 'text', text: 'ERROR: ' + JSON.stringify(r) }], isError: true };
     let photos_deleted = 0;
-    if (from_report_id) photos_deleted = await deleteAllPictures(r.id);
+    // include_photos:false est ignoré par Nockee pour les photos de pièces/éléments :
+    // on purge donc systématiquement après clonage, puis on vérifie qu'il n'en reste aucune.
+    if (from_report_id) {
+      photos_deleted = await deleteAllPictures(r.id);
+      const remaining = await collectAllPictures(r.id);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        id: r.id, type: r.type, photos_deleted, photos_remaining: remaining.length
+      }, null, 2) }] };
+    }
     return { content: [{ type: 'text', text: JSON.stringify({ id: r.id, type: r.type, photos_deleted }, null, 2) }] };
   }
 );
@@ -234,49 +294,19 @@ server.tool(
   }
 );
 
-/* ============================================================================
-   NOCKEE MCP — OUTILS SUPPLÉMENTAIRES
-   ----------------------------------------------------------------------------
-   Où coller : dans server.js, JUSTE APRÈS le dernier server.tool(...) existant
-   (celui de 'nockee_clear_signatories') et AVANT la ligne :
-
-        const app = express();
-
-   Rien d'autre à modifier : ça réutilise le helper nockee(), la fonction
-   deleteAllPictures() et l'objet `server` déjà présents dans ton fichier.
-   ============================================================================ */
-
-
-/* --- Helper générique : paginer entièrement un endpoint "list" ------------- */
-async function nkListAll(path) {
-  const items = [];
-  let cursor = null;
-  do {
-    const sep = path.includes('?') ? '&' : '?';
-    const url = path + sep + 'limit=100' + (cursor ? `&cursor=${cursor}` : '');
-    const r = await nockee('GET', url);
-    if (Array.isArray(r.data)) items.push(...r.data);
-    cursor = r && r.next_cursor;
-  } while (cursor);
-  return items;
-}
-
-
-/* =========================== PHOTOS ======================================== */
+/* =========================== PHOTOS (CORRIGÉ) ============================= */
 
 server.tool(
   'nockee_list_pictures',
-  'List all pictures of a report (optionally filtered by type). Returns picture ids/urls. Types: element, key, global, global_key, meter, room.',
+  'List all pictures of a report (optionally filtered by type). Aggregates room/element/meter/key/global photos. Types: element, key, global, global_key, meter, room.',
   {
     report_id: z.string().describe('UUID of the report'),
     type: z.enum(['element', 'key', 'global', 'global_key', 'meter', 'room']).optional()
       .describe('Optional picture type filter'),
   },
   async ({ report_id, type }) => {
-    let path = `/inspection_report_pictures?inspection_report=${report_id}`;
-    if (type) path += `&type=${type}`;
-    const items = await nkListAll(path);
-    const pictures = items.map(p => ({ id: p.id, type: p.type, url: p.url || p.file || null }));
+    const items = await collectAllPictures(report_id, type);
+    const pictures = items.map(p => ({ id: p.id, type: p.type, url: p.url || p.url_large || null }));
     return { content: [{ type: 'text', text: JSON.stringify({ count: pictures.length, pictures }, null, 2) }] };
   }
 );
@@ -293,14 +323,14 @@ server.tool(
 
 server.tool(
   'nockee_clear_pictures',
-  'Delete ALL pictures of a report (every type). Use to purge photos from an old or cloned report.',
+  'Delete ALL pictures of a report (every type: room/element/meter/key/global). Use to purge photos from an old or cloned report. Returns deleted count and remaining count (should be 0).',
   { report_id: z.string().describe('UUID of the report') },
   async ({ report_id }) => {
-    const total = await deleteAllPictures(report_id);   // fonction déjà présente dans server.js
-    return { content: [{ type: 'text', text: `${total} picture(s) deleted from report ${report_id}` }] };
+    const total = await deleteAllPictures(report_id);
+    const remaining = await collectAllPictures(report_id);
+    return { content: [{ type: 'text', text: `${total} picture(s) deleted from report ${report_id} — remaining: ${remaining.length}` }] };
   }
 );
-
 
 /* =========================== PIÈCES (ROOMS) =============================== */
 
@@ -346,7 +376,6 @@ server.tool(
     return { content: [{ type: 'text', text: 'Deleted room: ' + room_id }] };
   }
 );
-
 
 /* =========================== ÉLÉMENTS ===================================== */
 
@@ -395,7 +424,6 @@ server.tool(
   }
 );
 
-
 /* =========================== CLÉS & COMPTEURS ============================= */
 
 server.tool(
@@ -418,14 +446,7 @@ server.tool(
   }
 );
 
-
-/* =========================== PASSE-PARTOUT ================================
-   Accès brut à N'IMPORTE QUEL endpoint de l'API Nockee v2.
-   Permet de couvrir tout ce qui n'a pas d'outil dédié :
-   compare, invalidate_signatures, restore, external_users, estates,
-   persons, workspaces, webhooks, création de clés/compteurs, etc.
-   path = chemin après /v2  (ex: "/inspection_reports/<id>/restore")
-   ========================================================================= */
+/* =========================== PASSE-PARTOUT =============================== */
 server.tool(
   'nockee_request',
   'Advanced: raw call to any Nockee API v2 endpoint. method = GET/POST/PATCH/DELETE, path = everything after /v2 (must start with "/"), body = optional JSON object. Use for endpoints without a dedicated tool.',
@@ -440,7 +461,6 @@ server.tool(
     return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
   }
 );
-
 
 const app = express();
 app.use(express.json());
@@ -459,6 +479,6 @@ app.all('/mcp', async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', name: 'mcp-nockee', version: '1.0.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', name: 'mcp-nockee', version: '1.1.0' }));
 
 app.listen(PORT, () => console.log(`MCP Nockee started on port ${PORT}`));
