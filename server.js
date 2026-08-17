@@ -26,9 +26,6 @@ function nockee(method, path, body) {
   });
 }
 
-/* --------------------------------------------------------------------------
-   Pagination générique d'un endpoint "list" (renvoie { data, next_cursor }).
-   -------------------------------------------------------------------------- */
 async function nkListAll(path) {
   const items = [];
   let cursor = null;
@@ -42,21 +39,12 @@ async function nkListAll(path) {
   return items;
 }
 
-/* --------------------------------------------------------------------------
-   CORRECTIF PHOTOS
-   L'API /inspection_report_pictures n'accepte PAS le filtre inspection_report
-   pour les types room / element / meter / key : il faut filtrer par le parent
-   correspondant (room=, element=, meter=, key=) + type=. Seuls global et
-   global_key se filtrent par inspection_report.
-   On collecte donc toutes les photos en parcourant chaque parent.
-   -------------------------------------------------------------------------- */
 async function collectAllPictures(reportId, typeFilter) {
   const wanted = typeFilter
     ? [typeFilter]
     : ['global', 'global_key', 'room', 'element', 'meter', 'key'];
   const pics = [];
 
-  // Photos rattachées directement au rapport (globales)
   for (const type of ['global', 'global_key']) {
     if (!wanted.includes(type)) continue;
     pics.push(...await nkListAll(
@@ -64,7 +52,6 @@ async function collectAllPictures(reportId, typeFilter) {
     ));
   }
 
-  // Photos rattachées à un parent : on liste chaque parent puis ses photos
   const parents = [
     { type: 'room',    resource: 'rooms',    key: 'room' },
     { type: 'element', resource: 'elements', key: 'element' },
@@ -175,8 +162,6 @@ server.tool(
     const r = await nockee('POST', '/inspection_reports', body);
     if (!r.id) return { content: [{ type: 'text', text: 'ERROR: ' + JSON.stringify(r) }], isError: true };
     let photos_deleted = 0;
-    // include_photos:false est ignoré par Nockee pour les photos de pièces/éléments :
-    // on purge donc systématiquement après clonage, puis on vérifie qu'il n'en reste aucune.
     if (from_report_id) {
       photos_deleted = await deleteAllPictures(r.id);
       const remaining = await collectAllPictures(r.id);
@@ -294,8 +279,6 @@ server.tool(
   }
 );
 
-/* =========================== PHOTOS (CORRIGÉ) ============================= */
-
 server.tool(
   'nockee_list_pictures',
   'List all pictures of a report (optionally filtered by type). Aggregates room/element/meter/key/global photos. Types: element, key, global, global_key, meter, room.',
@@ -331,8 +314,6 @@ server.tool(
     return { content: [{ type: 'text', text: `${total} picture(s) deleted from report ${report_id} — remaining: ${remaining.length}` }] };
   }
 );
-
-/* =========================== PIÈCES (ROOMS) =============================== */
 
 server.tool(
   'nockee_list_rooms',
@@ -376,8 +357,6 @@ server.tool(
     return { content: [{ type: 'text', text: 'Deleted room: ' + room_id }] };
   }
 );
-
-/* =========================== ÉLÉMENTS ===================================== */
 
 server.tool(
   'nockee_list_elements',
@@ -424,8 +403,6 @@ server.tool(
   }
 );
 
-/* =========================== CLÉS & COMPTEURS ============================= */
-
 server.tool(
   'nockee_list_keys',
   'List keys of a report.',
@@ -446,7 +423,6 @@ server.tool(
   }
 );
 
-/* =========================== PASSE-PARTOUT =============================== */
 server.tool(
   'nockee_request',
   'Advanced: raw call to any Nockee API v2 endpoint. method = GET/POST/PATCH/DELETE, path = everything after /v2 (must start with "/"), body = optional JSON object. Use for endpoints without a dedicated tool.',
@@ -481,4 +457,5 @@ app.all('/mcp', async (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'ok', name: 'mcp-nockee', version: '1.1.0' }));
 
-app.listen(PORT, () => console.log(`MCP Nockee started on port ${PORT}`));
+// ── FIX RENDER : écouter sur 0.0.0.0 pour que le port scan fonctionne ──
+app.listen(PORT, '0.0.0.0', () => console.log(`MCP Nockee started on port ${PORT}`));
