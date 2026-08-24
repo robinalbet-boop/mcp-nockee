@@ -39,37 +39,67 @@ async function nkListAll(path) {
   return items;
 }
 
+// List every element of a report. Elements are children of ROOMS in Nockee,
+// so the `?inspection_report=` filter is unreliable (returns nothing on some
+// reports, which is why element/degradation photos survived clone purges).
+// We enumerate via rooms first, then fall back to the report-level filter,
+// and dedup by element id so both paths together never miss an element.
+async function listReportElements(reportId, rooms) {
+  const byId = new Map();
+  const roomsList = rooms || await nkListAll(`/inspection_report_rooms?inspection_report=${reportId}`);
+  for (const room of roomsList) {
+    for (const el of await nkListAll(`/inspection_report_elements?room=${room.id}`)) {
+      byId.set(el.id, el);
+    }
+  }
+  // belt-and-suspenders: also try the report-level filter
+  for (const el of await nkListAll(`/inspection_report_elements?inspection_report=${reportId}`)) {
+    byId.set(el.id, el);
+  }
+  return [...byId.values()];
+}
+
 async function collectAllPictures(reportId, typeFilter) {
   const wanted = typeFilter
     ? [typeFilter]
     : ['global', 'global_key', 'room', 'element', 'meter', 'key'];
-  const pics = [];
+  // dedup by picture id: a picture may be reachable via more than one path
+  const byId = new Map();
+  const add = (arr) => { for (const p of arr) if (p && p.id) byId.set(p.id, p); };
 
   for (const type of ['global', 'global_key']) {
     if (!wanted.includes(type)) continue;
-    pics.push(...await nkListAll(
-      `/inspection_report_pictures?inspection_report=${reportId}&type=${type}`
-    ));
+    add(await nkListAll(`/inspection_report_pictures?inspection_report=${reportId}&type=${type}`));
+  }
+
+  const rooms = await nkListAll(`/inspection_report_rooms?inspection_report=${reportId}`);
+
+  if (wanted.includes('room')) {
+    // no &type= : scoping by parent id is enough and avoids a mislabeled type slipping through
+    for (const room of rooms) {
+      add(await nkListAll(`/inspection_report_pictures?room=${room.id}`));
+    }
+  }
+
+  if (wanted.includes('element')) {
+    const elements = await listReportElements(reportId, rooms);
+    for (const el of elements) {
+      add(await nkListAll(`/inspection_report_pictures?element=${el.id}`));
+    }
   }
 
   const parents = [
-    { type: 'room',    resource: 'rooms',    key: 'room' },
-    { type: 'element', resource: 'elements', key: 'element' },
-    { type: 'meter',   resource: 'meters',   key: 'meter' },
-    { type: 'key',     resource: 'keys',     key: 'key' },
+    { type: 'meter', resource: 'meters', key: 'meter' },
+    { type: 'key',   resource: 'keys',   key: 'key' },
   ];
   for (const p of parents) {
     if (!wanted.includes(p.type)) continue;
-    const objs = await nkListAll(
-      `/inspection_report_${p.resource}?inspection_report=${reportId}`
-    );
+    const objs = await nkListAll(`/inspection_report_${p.resource}?inspection_report=${reportId}`);
     for (const o of objs) {
-      pics.push(...await nkListAll(
-        `/inspection_report_pictures?${p.key}=${o.id}&type=${p.type}`
-      ));
+      add(await nkListAll(`/inspection_report_pictures?${p.key}=${o.id}`));
     }
   }
-  return pics;
+  return [...byId.values()];
 }
 
 async function deleteAllPictures(reportId) {
@@ -92,7 +122,7 @@ async function deleteAllSignatories(reportId) {
   return count;
 }
 
-const server = new McpServer({ name: 'nockee', version: '1.1.0' });
+const server = new McpServer({ name: 'nockee', version: '1.2.0' });
 
 server.tool(
   'nockee_list_reports',
@@ -366,9 +396,9 @@ server.tool(
     room_id: z.string().optional().describe('Optional: filter by room'),
   },
   async ({ report_id, room_id }) => {
-    let path = `/inspection_report_elements?inspection_report=${report_id}`;
-    if (room_id) path += `&room=${room_id}`;
-    const items = await nkListAll(path);
+    const items = room_id
+      ? await nkListAll(`/inspection_report_elements?room=${room_id}`)
+      : await listReportElements(report_id);
     return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
   }
 );
@@ -455,7 +485,7 @@ app.all('/mcp', async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', name: 'mcp-nockee', version: '1.1.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', name: 'mcp-nockee', version: '1.2.0' }));
 
 // ── FIX RENDER : écouter sur 0.0.0.0 pour que le port scan fonctionne ──
 app.listen(PORT, '0.0.0.0', () => console.log(`MCP Nockee started on port ${PORT}`));
