@@ -33,17 +33,20 @@ async function nkListAll(path) {
     const sep = path.includes('?') ? '&' : '?';
     const url = path + sep + 'limit=100' + (cursor ? `&cursor=${cursor}` : '');
     const r = await nockee('GET', url);
-    if (Array.isArray(r.data)) items.push(...r.data);
-    cursor = r && r.next_cursor;
+    // Nockee returns {type:'validation_error',...} on a bad query. Treating that as
+    // "no items" silently hid pictures (and they survived clone purges) — fail loudly.
+    if (!r || !Array.isArray(r.data)) {
+      throw new Error(`Nockee GET ${url} did not return a list: ${JSON.stringify(r)}`);
+    }
+    items.push(...r.data);
+    cursor = r.next_cursor;
   } while (cursor);
   return items;
 }
 
-// List every element of a report. Elements are children of ROOMS in Nockee,
-// so the `?inspection_report=` filter is unreliable (returns nothing on some
-// reports, which is why element/degradation photos survived clone purges).
-// We enumerate via rooms first, then fall back to the report-level filter,
-// and dedup by element id so both paths together never miss an element.
+// List every element of a report. Elements are children of ROOMS in Nockee:
+// `/inspection_report_elements` REQUIRES a `room` filter (the API answers a
+// validation_error to `?inspection_report=`), so we enumerate room by room.
 async function listReportElements(reportId, rooms) {
   const byId = new Map();
   const roomsList = rooms || await nkListAll(`/inspection_report_rooms?inspection_report=${reportId}`);
@@ -51,10 +54,6 @@ async function listReportElements(reportId, rooms) {
     for (const el of await nkListAll(`/inspection_report_elements?room=${room.id}`)) {
       byId.set(el.id, el);
     }
-  }
-  // belt-and-suspenders: also try the report-level filter
-  for (const el of await nkListAll(`/inspection_report_elements?inspection_report=${reportId}`)) {
-    byId.set(el.id, el);
   }
   return [...byId.values()];
 }
@@ -74,17 +73,19 @@ async function collectAllPictures(reportId, typeFilter) {
 
   const rooms = await nkListAll(`/inspection_report_rooms?inspection_report=${reportId}`);
 
+  // `type` is REQUIRED by the Nockee API on every /inspection_report_pictures
+  // query (it answers a validation_error otherwise). Without it, room and
+  // element (degradation) photos were never listed, hence never purged.
   if (wanted.includes('room')) {
-    // no &type= : scoping by parent id is enough and avoids a mislabeled type slipping through
     for (const room of rooms) {
-      add(await nkListAll(`/inspection_report_pictures?room=${room.id}`));
+      add(await nkListAll(`/inspection_report_pictures?room=${room.id}&type=room`));
     }
   }
 
   if (wanted.includes('element')) {
     const elements = await listReportElements(reportId, rooms);
     for (const el of elements) {
-      add(await nkListAll(`/inspection_report_pictures?element=${el.id}`));
+      add(await nkListAll(`/inspection_report_pictures?element=${el.id}&type=element`));
     }
   }
 
@@ -96,7 +97,7 @@ async function collectAllPictures(reportId, typeFilter) {
     if (!wanted.includes(p.type)) continue;
     const objs = await nkListAll(`/inspection_report_${p.resource}?inspection_report=${reportId}`);
     for (const o of objs) {
-      add(await nkListAll(`/inspection_report_pictures?${p.key}=${o.id}`));
+      add(await nkListAll(`/inspection_report_pictures?${p.key}=${o.id}&type=${p.type}`));
     }
   }
   return [...byId.values()];
